@@ -66,6 +66,7 @@ import hudson.model.ManagementLink;
 import hudson.model.NoFingerprintMatch;
 import hudson.model.OverallLoadStatistics;
 import hudson.model.Project;
+import hudson.model.Queue.FlyweightTask;
 import hudson.model.RestartListener;
 import hudson.model.RootAction;
 import hudson.model.Slave;
@@ -135,7 +136,6 @@ import hudson.search.SearchItem;
 import hudson.security.ACL;
 import hudson.security.AccessControlled;
 import hudson.security.AuthorizationStrategy;
-import hudson.security.BasicAuthenticationFilter;
 import hudson.security.FederatedLoginService;
 import hudson.security.FullControlOnceLoggedInAuthorizationStrategy;
 import hudson.security.HudsonFilter;
@@ -160,7 +160,6 @@ import hudson.slaves.OfflineCause;
 import hudson.slaves.RetentionStrategy;
 import hudson.tasks.BuildWrapper;
 import hudson.tasks.Builder;
-import hudson.tasks.Mailer;
 import hudson.tasks.Publisher;
 import hudson.triggers.SafeTimerTask;
 import hudson.triggers.Trigger;
@@ -197,6 +196,10 @@ import jenkins.ExtensionComponentSet;
 import jenkins.ExtensionRefreshException;
 import jenkins.InitReactorRunner;
 import jenkins.model.ProjectNamingStrategy.DefaultProjectNamingStrategy;
+import jenkins.security.ConfidentialKey;
+import jenkins.security.ConfidentialStore;
+import jenkins.slaves.WorkspaceLocator;
+import jenkins.util.io.FileBoolean;
 import net.sf.json.JSONObject;
 import org.acegisecurity.AccessDeniedException;
 import org.acegisecurity.AcegiSecurityException;
@@ -248,6 +251,7 @@ import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletResponse;
 
 import static hudson.init.InitMilestone.*;
+import hudson.security.BasicAuthenticationFilter;
 import static javax.servlet.http.HttpServletResponse.SC_BAD_REQUEST;
 import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
 import java.io.File;
@@ -257,11 +261,11 @@ import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.BindException;
+import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.security.SecureRandom;
 import java.text.Collator;
-import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -295,6 +299,8 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 /**
  * Root object of the system.
@@ -302,7 +308,9 @@ import javax.annotation.CheckForNull;
  * @author Kohsuke Kawaguchi
  */
 @ExportedBean
-public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGroup, StaplerProxy, StaplerFallback, ViewGroup, AccessControlled, DescriptorByNameOwner, ModelObjectWithContextMenu {
+public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGroup, StaplerProxy, StaplerFallback,
+        ViewGroup, AccessControlled, DescriptorByNameOwner,
+        ModelObjectWithContextMenu, ModelObjectWithChildren {
     private transient final Queue queue;
 
     /**
@@ -377,17 +385,15 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     private ProjectNamingStrategy projectNamingStrategy = DefaultProjectNamingStrategy.DEFAULT_NAMING_STRATEGY;
 
     /**
-     * Root directory for the workspaces. This value will be variable-expanded against
-     * job name and JENKINS_HOME.
-     *
+     * Root directory for the workspaces.
+     * This value will be variable-expanded as per {@link #expandVariablesForDirectory}.
      * @see #getWorkspaceFor(TopLevelItem)
      */
     private String workspaceDir = "${ITEM_ROOTDIR}/"+WORKSPACE_DIRNAME;
 
     /**
-     * Root directory for the workspaces. This value will be variable-expanded against
-     * job name and JENKINS_HOME.
-     *
+     * Root directory for the builds.
+     * This value will be variable-expanded as per {@link #expandVariablesForDirectory}.
      * @see #getBuildDirFor(Job)
      */
     private String buildsDir = "${ITEM_ROOTDIR}/builds";
@@ -727,7 +733,10 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      * @param pluginManager
      *      If non-null, use existing plugin manager.  create a new one.
      */
-    @edu.umd.cs.findbugs.annotations.SuppressWarnings("SC_START_IN_CTOR") // bug in FindBugs. It flags UDPBroadcastThread.start() call but that's for another class
+    @edu.umd.cs.findbugs.annotations.SuppressWarnings({
+        "SC_START_IN_CTOR", // bug in FindBugs. It flags UDPBroadcastThread.start() call but that's for another class
+        "ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD" // Trigger.timer
+    })
     protected Jenkins(File root, ServletContext context, PluginManager pluginManager) throws IOException, InterruptedException, ReactorException {
         long start = System.currentTimeMillis();
         
@@ -750,7 +759,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
             final InitStrategy is = InitStrategy.get(Thread.currentThread().getContextClassLoader());
 
             Trigger.timer = new Timer("Jenkins cron thread");
-            queue = new Queue(CONSISTENT_HASH?LoadBalancer.CONSISTENT_HASH:LoadBalancer.DEFAULT);
+            queue = new Queue(LoadBalancer.CONSISTENT_HASH);
 
             try {
                 dependencyGraph = DependencyGraph.EMPTY;
@@ -771,6 +780,10 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
                 sr.nextBytes(random);
                 secretKey = Util.toHexString(random);
                 secretFile.write(secretKey);
+
+                // this marker indicates that the secret.key is generated by the version of Jenkins post SECURITY-49.
+                // this indicates that there's no need to rewrite secrets on disk
+                new FileBoolean(new File(root,"secret.key.not-so-secret")).on();
             }
 
             try {
@@ -785,7 +798,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
             // JSON binding needs to be able to see all the classes from all the plugins
             WebApp.get(servletContext).setClassLoader(pluginManager.uberClassLoader);
 
-            adjuncts = new AdjunctManager(servletContext, pluginManager.uberClassLoader,"adjuncts/"+SESSION_HASH);
+            adjuncts = new AdjunctManager(servletContext, pluginManager.uberClassLoader,"adjuncts/"+SESSION_HASH, TimeUnit2.DAYS.toMillis(365));
 
             // initialization consists of ...
             executeReactor( is,
@@ -808,20 +821,25 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
             } else
                 tcpSlaveAgentListener = null;
 
-            try {
-                udpBroadcastThread = new UDPBroadcastThread(this);
-                udpBroadcastThread.start();
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to broadcast over UDP",e);
+            if (UDPBroadcastThread.PORT != -1) {
+                try {
+                    udpBroadcastThread = new UDPBroadcastThread(this);
+                    udpBroadcastThread.start();
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to broadcast over UDP (use -Dhudson.udp=-1 to disable)", e);
+                }
             }
             dnsMultiCast = new DNSMultiCast(this);
 
-            Trigger.timer.scheduleAtFixedRate(new SafeTimerTask() {
-                @Override
-                protected void doRun() throws Exception {
-                    trimLabels();
-                }
-            }, TimeUnit2.MINUTES.toMillis(5), TimeUnit2.MINUTES.toMillis(5));
+            Timer timer = Trigger.timer;
+            if (timer != null) {
+                timer.scheduleAtFixedRate(new SafeTimerTask() {
+                    @Override
+                    protected void doRun() throws Exception {
+                        trimLabels();
+                    }
+                }, TimeUnit2.MINUTES.toMillis(5), TimeUnit2.MINUTES.toMillis(5));
+            }
 
             updateComputerList();
 
@@ -966,7 +984,15 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     }
 
     /**
+     * @since 1.484
+     */
+    public View.AsynchPeople getAsynchPeople() {
+        return new View.AsynchPeople(this);
+    }
+
+    /**
      * Does this {@link View} has any associated user information recorded?
+     * @deprecated Potentially very expensive call; do not use from Jelly views.
      */
     public boolean hasPeople() {
         return View.People.isApplicable(items.values());
@@ -980,6 +1006,10 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      * Returns a secret key that survives across container start/stop.
      * <p>
      * This value is useful for implementing some of the security features.
+     *
+     * @deprecated
+     *      Due to the past security advisory, this value should not be used any more to protect sensitive information.
+     *      See {@link ConfidentialStore} and {@link ConfidentialKey} for how to store secrets.
      */
     public String getSecretKey() {
         return secretKey;
@@ -988,9 +1018,27 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     /**
      * Gets {@linkplain #getSecretKey() the secret key} as a key for AES-128.
      * @since 1.308
+     * @deprecated
+     *       See {@link #getSecretKey()}.
      */
     public SecretKey getSecretKeyAsAES128() {
         return Util.toAes128Key(secretKey);
+    }
+
+    /**
+     * Returns the unique identifier of this Jenkins that has been historically used to identify
+     * this Jenkins to the outside world.
+     *
+     * <p>
+     * This form of identifier is weak in that it can be impersonated by others. See
+     * https://wiki.jenkins-ci.org/display/JENKINS/Instance+Identity for more modern form of instance ID
+     * that can be challenged and verified.
+     *
+     * @since 1.498
+     */
+    @SuppressWarnings("deprecation")
+    public String getLegacyInstanceId() {
+        return Util.getDigestOf(getSecretKey());
     }
 
     /**
@@ -1215,7 +1263,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     }
 
     /**
-     * Synonym to {@link #getNodeDescription()}.
+     * Synonym for {@link #getDescription}.
      */
     public String getSystemMessage() {
         return systemMessage;
@@ -1342,24 +1390,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      * and filter them by the given type.
      */
     public <T extends Item> List<T> getAllItems(Class<T> type) {
-        List<T> r = new ArrayList<T>();
-
-        Stack<ItemGroup> q = new Stack<ItemGroup>();
-        q.push(this);
-
-        while(!q.isEmpty()) {
-            ItemGroup<?> parent = q.pop();
-            for (Item i : parent.getItems()) {
-                if(type.isInstance(i)) {
-                    if (i.hasPermission(Item.READ))
-                        r.add(type.cast(i));
-                }
-                if(i instanceof ItemGroup)
-                    q.push((ItemGroup)i);
-            }
-        }
-
-        return r;
+        return Items.getAllItems(this, type);
     }
 
     /**
@@ -1470,7 +1501,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     }
 
     /**
-     * Returns true if the current running Hudson is upgraded from a version earlier than the specified version.
+     * Returns true if the current running Jenkins is upgraded from a version earlier than the specified version.
      *
      * <p>
      * This method continues to return true until the system configuration is saved, at which point
@@ -1528,6 +1559,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      */
     public Label getLabel(String expr) {
         if(expr==null)  return null;
+        expr = hudson.util.QuotedStringTokenizer.unquote(expr);
         while(true) {
             Label l = labels.get(expr);
             if(l!=null)
@@ -1545,8 +1577,9 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
 
     /**
      * Returns the label atom of the given name.
+     * @return non-null iff name is non-null
      */
-    public LabelAtom getLabelAtom(String name) {
+    public @Nullable LabelAtom getLabelAtom(@CheckForNull String name) {
         if (name==null)  return null;
 
         while(true) {
@@ -1619,7 +1652,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     /**
      * Gets the slave node of the give name, hooked under this Hudson.
      */
-    public Node getNode(String name) {
+    public @CheckForNull Node getNode(String name) {
         return slaves.getNode(name);
     }
 
@@ -1656,7 +1689,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     /**
      * Removes a {@link Node} from Hudson.
      */
-    public synchronized void removeNode(Node n) throws IOException {
+    public synchronized void removeNode(@Nonnull Node n) throws IOException {
         Computer c = n.toComputer();
         if (c!=null)
             c.disconnect(OfflineCause.create(Messages._Hudson_NodeBeingRemoved()));
@@ -1725,6 +1758,17 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
 
         public FormValidation doCheckNumExecutors(@QueryParameter String value) {
             return FormValidation.validateNonNegativeInteger(value);
+        }
+
+        public FormValidation doCheckRawBuildsDir(@QueryParameter String value) {
+            if (!value.contains("${")) {
+                File d = new File(value);
+                if (!d.isDirectory() && (d.getParentFile() == null || !d.getParentFile().canWrite())) {
+                    return FormValidation.error(value + " does not exist and probably cannot be created");
+                }
+                // XXX failure to use either ITEM_* variable might be an error too?
+            }
+            return FormValidation.ok(); // XXX assumes it will be OK after substitution, but can we be sure?
         }
 
         // to route /descriptor/FQCN/xxx to getDescriptor(FQCN).xxx
@@ -1814,15 +1858,13 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      * @since 1.66
      * @see Descriptor#getCheckUrl(String)
      * @see #getRootUrlFromRequest()
+     * @see <a href="https://wiki.jenkins-ci.org/display/JENKINS/Hyperlinks+in+HTML">Hyperlinks in HTML</a>
      */
     public String getRootUrl() {
-        // for compatibility. the actual data is stored in Mailer
-        String url = Mailer.descriptor().getUrl();
+        String url = JenkinsLocationConfiguration.get().getUrl();
         if(url!=null) {
-            if (!url.endsWith("/")) url += '/';
-            return url;
+            return Util.ensureEndsWith(url,"/");
         }
-
         StaplerRequest req = Stapler.getCurrentRequest();
         if(req!=null)
             return getRootUrlFromRequest();
@@ -1874,6 +1916,13 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     }
 
     public FilePath getWorkspaceFor(TopLevelItem item) {
+        for (WorkspaceLocator l : WorkspaceLocator.all()) {
+            FilePath workspace = l.locate(item, this);
+            if (workspace != null) {
+                return workspace;
+            }
+        }
+ 
         return new FilePath(expandVariablesForDirectory(workspaceDir, item));
     }
 
@@ -1885,7 +1934,8 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
         return new File(Util.replaceMacro(base, ImmutableMap.of(
                 "JENKINS_HOME", getRootDir().getPath(),
                 "ITEM_ROOTDIR", item.getRootDir().getPath(),
-                "ITEM_FULLNAME", item.getFullName())));
+                "ITEM_FULLNAME", item.getFullName(),   // legacy, deprecated
+                "ITEM_FULL_NAME", item.getFullName().replace(':','$')))); // safe, see JENKINS-12251
     }
     
     public String getRawWorkspaceDir() {
@@ -2221,7 +2271,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
             if (ctx instanceof ItemGroup) {
                 ItemGroup g = (ItemGroup) ctx;
                 Item i = g.getItem(s);
-                if (i==null || !i.hasPermission(Item.READ)) {
+                if (i==null || !i.hasPermission(Item.READ)) { // XXX consider DISCOVER
                     ctx=null;    // can't go up further
                     break;
                 }
@@ -2289,7 +2339,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
                 return null;    // this item can't have any children
 
             if (!item.hasPermission(Item.READ))
-                return null;
+                return null; // XXX consider DISCOVER
 
             parent = (ItemGroup) item;
         }
@@ -2434,7 +2484,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
 
     private synchronized TaskBuilder loadTasks() throws IOException {
         File projectsDir = new File(root,"jobs");
-        if(!projectsDir.isDirectory() && !projectsDir.mkdirs()) {
+        if(!projectsDir.getCanonicalFile().isDirectory() && !projectsDir.mkdirs()) {
             if(projectsDir.exists())
                 throw new IOException(projectsDir+" is not a directory");
             throw new IOException("Unable to create "+projectsDir+"\nPermission issue? Please create this directory manually.");
@@ -2444,6 +2494,8 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
                 return child.isDirectory() && Items.getConfigFile(child).exists();
             }
         });
+
+        final Set<String> loadedNames = Collections.synchronizedSet(new HashSet<String>());
 
         TaskGraphBuilder g = new TaskGraphBuilder();
         Handle loadHudson = g.requires(EXTENSIONS_AUGMENTED).attains(JOB_LOADED).add("Loading global config", new Executable() {
@@ -2467,7 +2519,6 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
                 if (slaves == null) slaves = new NodeList();
 
                 clouds.setOwner(Jenkins.this);
-                items.clear();
 
                 // JENKINS-8043: re-add the slaves which were not saved into the config file
                 // and are now missing, but still connected.
@@ -2490,9 +2541,25 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
                 public void run(Reactor session) throws Exception {
                     TopLevelItem item = (TopLevelItem) Items.load(Jenkins.this, subdir);
                     items.put(item.getName(), item);
+                    loadedNames.add(item.getName());
                 }
             });
         }
+
+        g.requires(JOB_LOADED).add("Cleaning up old builds",new Executable() {
+            public void run(Reactor reactor) throws Exception {
+                // anything we didn't load from disk, throw them away.
+                // doing this after loading from disk allows newly loaded items
+                // to inspect what already existed in memory (in case of reloading)
+
+                // retainAll doesn't work well because of CopyOnWriteMap implementation, so remove one by one
+                // hopefully there shouldn't be too many of them.
+                for (String name : items.keySet()) {
+                    if (!loadedNames.contains(name))
+                        items.remove(name);
+                }
+            }
+        });
 
         g.requires(JOB_LOADED).add("Finalizing set up",new Executable() {
             public void run(Reactor session) throws Exception {
@@ -2563,6 +2630,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     /**
      * Called to shut down the system.
      */
+    @edu.umd.cs.findbugs.annotations.SuppressWarnings("ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD")
     public void cleanUp() {
         for (ItemListener l : ItemListener.all())
             l.onBeforeShutdown();
@@ -2579,7 +2647,10 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
         if(dnsMultiCast!=null)
             dnsMultiCast.close();
         interruptReloadThread();
-        Trigger.timer.cancel();
+        Timer timer = Trigger.timer;
+        if (timer != null) {
+            timer.cancel();
+        }
         // TODO: how to wait for the completion of the last job?
         Trigger.timer = null;
         if(tcpSlaveAgentListener!=null)
@@ -2649,7 +2720,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
             jdks.addAll(req.bindJSONToList(JDK.class,json.get("jdks")));
 
             boolean result = true;
-            for( Descriptor<?> d : Functions.getSortedDescriptorsForGlobalConfig() )
+            for (Descriptor<?> d : Functions.getSortedDescriptorsForGlobalConfigUnclassified())
                 result &= configureDescriptor(req,json,d);
 
             version = VERSION;
@@ -2774,7 +2845,11 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
         Map<String,Future<Map<String,String>>> future = new HashMap<String, Future<Map<String, String>>>();
 
         for (Computer c : getComputers()) {
-            future.put(c.getName(), RemotingDiagnostics.getThreadDumpAsync(c.getChannel()));
+            try {
+                future.put(c.getName(), RemotingDiagnostics.getThreadDumpAsync(c.getChannel()));
+            } catch(Exception e) {
+                LOGGER.info("Failed to get thread dump for node " + c.getName() + ": " + e.getMessage());
+            }
         }
 		if (toComputer() == null) {
 			future.put("master", RemotingDiagnostics.getThreadDumpAsync(MasterComputer.localChannel));
@@ -2829,13 +2904,15 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      * Check if the given name is suitable as a name
      * for job, view, etc.
      *
-     * @throws ParseException
+     * @throws Failure
      *      if the given name is not good
      */
     public static void checkGoodName(String name) throws Failure {
         if(name==null || name.length()==0)
             throw new Failure(Messages.Hudson_NoName());
 
+        if("..".equals(name.trim())) 
+            throw new Failure(Messages.Jenkins_NotAllowedName(".."));
         for( int i=0; i<name.length(); i++ ) {
             char ch = name.charAt(i);
             if(Character.isISOControl(ch)) {
@@ -2850,7 +2927,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
 
     /**
      * Makes sure that the given name is good as a job name.
-     * @return trimmed name if valid; throws ParseException if not
+     * @return trimmed name if valid; throws Failure if not
      */
     private String checkJobName(String name) throws Failure {
         checkGoodName(name);
@@ -2943,6 +3020,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      * Reloads the configuration.
      */
     @CLIMethod(name="reload-configuration")
+    @RequirePOST
     public synchronized HttpResponse doReload() throws IOException {
         checkPermission(ADMINISTER);
 
@@ -3013,10 +3091,18 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     public ContextMenu doContextMenu(StaplerRequest request, StaplerResponse response) throws IOException, JellyException {
         ContextMenu menu = new ContextMenu().from(this, request, response);
         for (MenuItem i : menu.items) {
-            if (i.url.equals("/manage")) {
+            if (i.url.equals(request.getContextPath() + "/manage")) {
                 // add "Manage Jenkins" subitems
                 i.subMenu = new ContextMenu().from(this, request, response, "manage");
             }
+        }
+        return menu;
+    }
+
+    public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+        ContextMenu menu = new ContextMenu();
+        for (View view : getViews()) {
+            menu.add(view.getViewUrl(),view.getDisplayName());
         }
         return menu;
     }
@@ -3272,25 +3358,31 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      * Run arbitrary Groovy script.
      */
     public void doScript(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
-        doScript(req, rsp, req.getView(this, "_script.jelly"));
+        _doScript(req, rsp, req.getView(this, "_script.jelly"), MasterComputer.localChannel, getACL());
     }
 
     /**
      * Run arbitrary Groovy script and return result as plain text.
      */
     public void doScriptText(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
-        doScript(req, rsp, req.getView(this, "_scriptText.jelly"));
+        _doScript(req, rsp, req.getView(this, "_scriptText.jelly"), MasterComputer.localChannel, getACL());
     }
 
-    private void doScript(StaplerRequest req, StaplerResponse rsp, RequestDispatcher view) throws IOException, ServletException {
+    /**
+     * @since 1.509.1
+     */
+    public static void _doScript(StaplerRequest req, StaplerResponse rsp, RequestDispatcher view, VirtualChannel channel, ACL acl) throws IOException, ServletException {
         // ability to run arbitrary script is dangerous
-        checkPermission(RUN_SCRIPTS);
+        acl.checkPermission(RUN_SCRIPTS);
 
         String text = req.getParameter("script");
         if (text != null) {
+            if (!"POST".equals(req.getMethod())) {
+                throw HttpResponses.error(HttpURLConnection.HTTP_BAD_METHOD, "requires POST");
+            }
             try {
                 req.setAttribute("output",
-                        RemotingDiagnostics.executeGroovy(text, MasterComputer.localChannel));
+                        RemotingDiagnostics.executeGroovy(text, channel));
             } catch (InterruptedException e) {
                 throw new ServletException(e);
             }
@@ -3306,7 +3398,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
      */
     @RequirePOST
     public void doEval(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
-        checkPermission(ADMINISTER);
+        checkPermission(RUN_SCRIPTS);
 
         try {
             MetaClass mc = WebApp.getCurrent().getMetaClass(getClass());
@@ -3389,7 +3481,33 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
     }
 
     /**
+     * Checks if a top-level view with the given name exists and 
+     * make sure that the name is good as a view name.
+     */
+    public FormValidation doCheckViewName(@QueryParameter String value) {
+        checkPermission(View.CREATE);
+        
+        String name = fixEmpty(value);
+        if (name == null) 
+            return FormValidation.ok();
+        
+        // already exists?
+        if (getView(name) != null) 
+            return FormValidation.error(Messages.Hudson_ViewAlreadyExists(name));
+        
+        // good view name?
+        try {
+            checkGoodName(name);
+        } catch (Failure e) {
+            return FormValidation.error(e.getMessage());
+        }
+
+        return FormValidation.ok();
+    }
+    
+    /**
      * Checks if a top-level view with the given name exists.
+     * @deprecated 1.512
      */
     public FormValidation doViewExistsCheck(@QueryParameter String value) {
         checkPermission(View.CREATE);
@@ -3510,24 +3628,42 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
             || rest.startsWith("/accessDenied")
             || rest.startsWith("/adjuncts/")
             || rest.startsWith("/signup")
-            || rest.startsWith("/jnlpJars/")
             || rest.startsWith("/tcpSlaveAgentListener")
+            // XXX SlaveComputer.doSlaveAgentJnlp; there should be an annotation to request unprotected access
+            || rest.matches("/computer/[^/]+/slave-agent[.]jnlp") && "true".equals(Stapler.getCurrentRequest().getParameter("encrypt"))
             || rest.startsWith("/cli")
-            || rest.startsWith("/whoAmI")
             || rest.startsWith("/federatedLoginService/")
             || rest.startsWith("/securityRealm"))
                 return this;    // URLs that are always visible without READ permission
 
-            for (Action a : getActions()) {
-                if (a instanceof UnprotectedRootAction) {
-                    if (rest.startsWith("/"+a.getUrlName()+"/") || rest.equals("/"+a.getUrlName()))
-                        return this;
+            for (String name : getUnprotectedRootActions()) {
+                if (rest.startsWith("/" + name + "/") || rest.equals("/" + name)) {
+                    return this;
                 }
             }
 
             throw e;
         }
         return this;
+    }
+
+    /**
+     * Gets a list of unprotected root actions.
+     * These URL prefixes should be exempted from access control checks by container-managed security.
+     * Ideally would be synchronized with {@link #getTarget}.
+     * @return a list of {@linkplain Action#getUrlName URL names}
+     * @since 1.495
+     */
+    public Collection<String> getUnprotectedRootActions() {
+        Set<String> names = new TreeSet<String>();
+        names.add("jnlpJars"); // XXX cleaner to refactor doJnlpJars into a URA
+        // XXX consider caching (expiring cache when actions changes)
+        for (Action a : getActions()) {
+            if (a instanceof UnprotectedRootAction) {
+                names.add(a.getUrlName());
+            }
+        }
+        return names;
     }
 
     /**
@@ -3651,6 +3787,15 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
 
         public RetentionStrategy getRetentionStrategy() {
             return RetentionStrategy.NOOP;
+        }
+
+        /**
+         * Will always keep this guy alive so that it can function as a fallback to
+         * execute {@link FlyweightTask}s. See JENKINS-7291.
+         */
+        @Override
+        protected boolean isAlive() {
+            return true;
         }
 
         /**
@@ -3812,7 +3957,7 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
 
     /**
      * Prefix to static resources like images and javascripts in the war file.
-     * Either "" or strings like "/static/VERSION", which avoids Hudson to pick up
+     * Either "" or strings like "/static/VERSION", which avoids Jenkins to pick up
      * stale cache when the user upgrades to a different version.
      * <p>
      * Value computed in {@link WebAppMain}.
@@ -3830,7 +3975,6 @@ public class Jenkins extends AbstractCIBase implements ModifiableTopLevelItemGro
 
     public static boolean PARALLEL_LOAD = Configuration.getBooleanConfigParameter("parallelLoad", true);
     public static boolean KILL_AFTER_LOAD = Configuration.getBooleanConfigParameter("killAfterLoad", false);
-    private static final boolean CONSISTENT_HASH = true; // Boolean.getBoolean(Hudson.class.getName()+".consistentHash");
     /**
      * Enabled by default as of 1.337. Will keep it for a while just in case we have some serious problems.
      */

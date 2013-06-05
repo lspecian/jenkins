@@ -26,6 +26,7 @@ package hudson.model;
 
 import hudson.Extension;
 import hudson.Util;
+import hudson.diagnosis.OldDataMonitor;
 import hudson.model.Descriptor.FormException;
 import hudson.util.CaseInsensitiveComparator;
 import hudson.util.DescribableList;
@@ -33,24 +34,28 @@ import hudson.util.FormValidation;
 import hudson.util.HttpResponses;
 import hudson.views.ListViewColumn;
 import hudson.views.ViewJobFilter;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.HttpResponse;
-import org.kohsuke.stapler.QueryParameter;
-import org.kohsuke.stapler.StaplerRequest;
-import org.kohsuke.stapler.StaplerResponse;
-import org.kohsuke.stapler.interceptor.RequirePOST;
 
-import javax.annotation.concurrent.GuardedBy;
-import javax.servlet.ServletException;
-import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
+
+import javax.annotation.concurrent.GuardedBy;
+import javax.servlet.ServletException;
+
+import net.sf.json.JSONObject;
+
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 /**
  * Displays {@link Job}s in a flat list view.
@@ -63,7 +68,7 @@ public class ListView extends View implements Saveable {
      * List of job names. This is what gets serialized.
      */
     @GuardedBy("this")
-    /*package*/ final SortedSet<String> jobNames = new TreeSet<String>(CaseInsensitiveComparator.INSTANCE);
+    /*package*/ /*almost-final*/ SortedSet<String> jobNames = new TreeSet<String>(CaseInsensitiveComparator.INSTANCE);
     
     private DescribableList<ViewJobFilter, Descriptor<ViewJobFilter>> jobFilters;
 
@@ -73,6 +78,11 @@ public class ListView extends View implements Saveable {
      * Include regex string.
      */
     private String includeRegex;
+    
+    /**
+     * Whether to recurse in ItemGroups
+     */
+    private boolean recurse;
     
     /**
      * Compiled include pattern from the includeRegex string.
@@ -98,8 +108,17 @@ public class ListView extends View implements Saveable {
     }
 
     private Object readResolve() {
-        if(includeRegex!=null)
-            includePattern = Pattern.compile(includeRegex);
+        if(includeRegex!=null) {
+            try {
+                includePattern = Pattern.compile(includeRegex);
+            } catch (PatternSyntaxException x) {
+                includeRegex = null;
+                OldDataMonitor.report(this, Collections.<Throwable>singleton(x));
+            }
+        }
+        if (jobNames == null) {
+            jobNames = new TreeSet<String>(CaseInsensitiveComparator.INSTANCE);
+        }
         initColumns();
         initJobFilters();
         return this;
@@ -139,33 +158,27 @@ public class ListView extends View implements Saveable {
      */
     public List<TopLevelItem> getItems() {
         SortedSet<String> names;
+        List<TopLevelItem> items = new ArrayList<TopLevelItem>();
 
         synchronized (this) {
             names = new TreeSet<String>(jobNames);
         }
 
-        if (includePattern != null) {
-            for (Item item : getOwnerItemGroup().getItems()) {
-                String itemName = item.getName();
-                if (includePattern.matcher(itemName).matches()) {
-                    names.add(itemName);
-                }
-            }
-        }
+        ItemGroup<? extends TopLevelItem> parent = getOwnerItemGroup();
+        includeItems(parent, names);
 
         Boolean statusFilter = this.statusFilter; // capture the value to isolate us from concurrent update
-        List<TopLevelItem> items = new ArrayList<TopLevelItem>(names.size());
-        for (String n : names) {
-            TopLevelItem item = getOwnerItemGroup().getItem(n);
+        for (TopLevelItem item : Items.getAllItems(getOwnerItemGroup(), TopLevelItem.class)) {
+            if (!names.contains(item.getRelativeNameFrom(getOwnerItemGroup()))) continue;
             // Add if no status filter or filter matches enabled/disabled status:
-            if(item!=null && (statusFilter == null || !(item instanceof AbstractProject)
-                              || ((AbstractProject)item).isDisabled() ^ statusFilter))
+            if(statusFilter == null || !(item instanceof AbstractProject)
+                              || ((AbstractProject)item).isDisabled() ^ statusFilter)
                 items.add(item);
         }
 
         // check the filters
         Iterable<ViewJobFilter> jobFilters = getJobFilters();
-        List<TopLevelItem> allItems = new ArrayList<TopLevelItem>(getOwnerItemGroup().getItems());
+        List<TopLevelItem> allItems = new ArrayList<TopLevelItem>(parent.getItems());
     	for (ViewJobFilter jobFilter: jobFilters) {
     		items = jobFilter.filter(items, allItems, this);
     	}
@@ -174,10 +187,39 @@ public class ListView extends View implements Saveable {
         
         return items;
     }
-
-    public synchronized boolean contains(TopLevelItem item) {
-        return jobNames.contains(item.getName());
+    
+    @Override
+    public boolean contains(TopLevelItem item) {
+      return getItems().contains(item);
     }
+    
+    private void includeItems(ItemGroup<? extends TopLevelItem> parent, SortedSet<String> names) {
+        includeItems(parent, parent, names);
+    }
+    
+    private void includeItems(ItemGroup<? extends TopLevelItem> root, ItemGroup<?> parent, SortedSet<String> names) {
+        if (includePattern != null) {
+            for (Item item : parent.getItems()) {
+                if (recurse && item instanceof ItemGroup) {
+                    ItemGroup<?> ig = (ItemGroup<?>) item;
+                    includeItems(root, ig, names);
+                }
+                if (item instanceof TopLevelItem) {
+                    String itemName = item.getRelativeNameFrom(root);
+                    if (includePattern.matcher(itemName).matches()) {
+                        names.add(itemName);
+                    }
+                }
+            }
+        }
+    }
+    
+    public synchronized boolean jobNamesContains(TopLevelItem item) {
+        if (item == null) return false;
+        return jobNames.contains(item.getRelativeNameFrom(getOwnerItemGroup()));
+    }
+
+    
 
     /**
      * Adds the given item to this view.
@@ -186,13 +228,24 @@ public class ListView extends View implements Saveable {
      */
     public void add(TopLevelItem item) throws IOException {
         synchronized (this) {
-            jobNames.add(item.getName());
+            jobNames.add(item.getRelativeNameFrom(getOwnerItemGroup()));
         }
         save();
     }
 
     public String getIncludeRegex() {
         return includeRegex;
+    }
+    
+    public boolean isRecurse() {
+        return recurse;
+    }
+    
+    /*
+     * For testing purposes
+     */
+    void setRecurse(boolean recurse) {
+        this.recurse = recurse;
     }
 
     /**
@@ -209,7 +262,7 @@ public class ListView extends View implements Saveable {
             TopLevelItem item = ((ModifiableItemGroup<? extends TopLevelItem>)ig).doCreateItem(req, rsp);
             if(item!=null) {
                 synchronized (this) {
-                    jobNames.add(item.getName());
+                    jobNames.add(item.getRelativeNameFrom(getOwnerItemGroup()));
                 }
                 owner.save();
             }
@@ -258,11 +311,21 @@ public class ListView extends View implements Saveable {
      */
     @Override
     protected void submit(StaplerRequest req) throws ServletException, FormException, IOException {
+        JSONObject json = req.getSubmittedForm();
         synchronized (this) {
+            recurse = json.optBoolean("recurse", true);
             jobNames.clear();
-            for (TopLevelItem item : getOwnerItemGroup().getItems()) {
-                if(req.getParameter(item.getName())!=null)
-                    jobNames.add(item.getName());
+            Iterable<? extends TopLevelItem> items;
+            if (recurse) {
+                items = Items.getAllItems(getOwnerItemGroup(), TopLevelItem.class);
+            } else {
+                items = getOwnerItemGroup().getItems();
+            }
+            for (TopLevelItem item : items) {
+                String relativeNameFrom = item.getRelativeNameFrom(getOwnerItemGroup());
+                if(req.getParameter(relativeNameFrom)!=null) {
+                    jobNames.add(relativeNameFrom);
+                }
             }
         }
 
@@ -280,19 +343,19 @@ public class ListView extends View implements Saveable {
         if (columns == null) {
             columns = new DescribableList<ListViewColumn,Descriptor<ListViewColumn>>(this);
         }
-        columns.rebuildHetero(req, req.getSubmittedForm(), ListViewColumn.all(), "columns");
+        columns.rebuildHetero(req, json, ListViewColumn.all(), "columns");
         
         if (jobFilters == null) {
         	jobFilters = new DescribableList<ViewJobFilter,Descriptor<ViewJobFilter>>(this);
         }
-        jobFilters.rebuildHetero(req, req.getSubmittedForm(), ViewJobFilter.all(), "jobFilters");
+        jobFilters.rebuildHetero(req, json, ViewJobFilter.all(), "jobFilters");
 
         String filter = Util.fixEmpty(req.getParameter("statusFilter"));
         statusFilter = filter != null ? "1".equals(filter) : null;
     }
 
     @Extension
-    public static final class DescriptorImpl extends ViewDescriptor {
+    public static class DescriptorImpl extends ViewDescriptor {
         public String getDisplayName() {
             return Messages.ListView_DisplayName();
         }

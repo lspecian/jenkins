@@ -36,7 +36,7 @@ THE SOFTWARE.
         <td>
         <l:hasPermission permission="${app.pluginManager.CONFIGURE_UPDATECENTER}">
           <h1>${%HTTP Proxy Configuration}</h1>
-          <f:form method="post" action="proxyConfigure">
+          <f:form method="post" action="proxyConfigure" name="proxyConfigure">
             <j:scope>
               <j:set var="instance" value="${app.proxy}"/>
               <j:set var="descriptor" value="${it.proxyDescriptor}"/>
@@ -46,7 +46,7 @@ THE SOFTWARE.
               <f:submit value="${%Submit}" />
             </f:block>
           </f:form>
-	</l:hasPermission>
+        </l:hasPermission>
 
         <l:hasPermission permission="${app.pluginManager.UPLOAD_PLUGINS}">
           <h1>${%Upload Plugin}</h1>
@@ -67,14 +67,30 @@ THE SOFTWARE.
         </l:hasPermission>
         <l:hasPermission permission="${app.pluginManager.CONFIGURE_UPDATECENTER}">
           <h1>${%Update Site}</h1>
-          <f:form method="post" action="siteConfigure">
+          <f:form method="post" action="siteConfigure" name="siteConfigure">
             <f:entry title="${%URL}" >
-              <f:textbox name="site" value="${app.updateCenter.getSite('default').url}" />
+              <f:textbox name="site" value="${app.updateCenter.getSite(app.updateCenter.ID_DEFAULT).url}" />
             </f:entry>
             <f:block>
               <f:submit value="${%Submit}" />
             </f:block>
           </f:form>
+          <j:set var="hasNonDefault" value="${false}"/>
+          <j:forEach var="site" items="${app.updateCenter.sites}">
+            <j:if test="${site.id != app.updateCenter.ID_DEFAULT}">
+              <j:set var="hasNonDefault" value="${true}"/>
+            </j:if>
+          </j:forEach>
+          <j:if test="${hasNonDefault}">
+            <h2>${%Other Sites}</h2>
+            <ul>
+              <j:forEach var="site" items="${app.updateCenter.sites}">
+                <j:if test="${site.id != app.updateCenter.ID_DEFAULT}">
+                  <li>${site.url}</li>
+                </j:if>
+              </j:forEach>
+            </ul>
+          </j:if>
        </l:hasPermission>
         </td>
       </tr>

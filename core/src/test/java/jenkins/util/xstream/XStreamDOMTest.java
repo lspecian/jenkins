@@ -31,8 +31,12 @@ import org.junit.Test;
 import static org.junit.Assert.*;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.StringReader;
+import java.io.StringWriter;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -58,8 +62,17 @@ public class XStreamDOMTest {
         Foo foo = createSomeFoo();
         String xml = xs.toXML(foo);
         System.out.println(xml);
-        assertEquals(IOUtils.toString(getClass().getResourceAsStream("XStreamDOMTest.data1.xml")).trim(),xml.trim());
+        assertEquals(getTestData1().trim(), xml.trim());
     }
+
+    private String getTestData1() throws IOException {
+        return getTestData("XStreamDOMTest.data1.xml");
+    }
+
+    private String getTestData(String resourceName) throws IOException {
+        return IOUtils.toString(getClass().getResourceAsStream(resourceName)).replaceAll("\r\n", "\n");
+    }
+
 
     private Foo createSomeFoo() {
         Foo foo = new Foo();
@@ -70,7 +83,13 @@ public class XStreamDOMTest {
 
     @Test
     public void testUnmarshal() throws Exception {
-        Foo foo = (Foo) xs.fromXML(getClass().getResourceAsStream("XStreamDOMTest.data1.xml"));
+        InputStream is = XStreamDOMTest.class.getResourceAsStream("XStreamDOMTest.data1.xml");
+        Foo foo;
+        try {
+            foo = (Foo) xs.fromXML(is);
+        } finally {
+            is.close();
+        }
         assertEquals("test1",foo.bar.getTagName());
         assertEquals("value",foo.bar.getAttribute("key"));
         assertEquals("text!",foo.bar.getValue());
@@ -84,7 +103,7 @@ public class XStreamDOMTest {
 
         String xml = xs.toXML(foo);
         System.out.println(xml);
-        assertEquals(IOUtils.toString(getClass().getResourceAsStream("XStreamDOMTest.data1.xml")).trim(),xml.trim());
+        assertEquals(getTestData1().trim(), xml.trim());
     }
 
     @Test
@@ -140,6 +159,46 @@ public class XStreamDOMTest {
                 assertXStreamDOMEquals(expected.getChildren().get(i), actual.getChildren().get(i));
             }
         }
-        
+    }
+
+    @Test
+    public void readFromInputStream() throws Exception {
+        for (String name : new String[]{"XStreamDOMTest.data1.xml","XStreamDOMTest.data2.xml"}) {
+            String input = getTestData(name);
+            XStreamDOM dom = XStreamDOM.from(new StringReader(input));
+            StringWriter sw = new StringWriter();
+            dom.writeTo(sw);
+            assertEquals(input.trim(),sw.toString().trim());
+        }
+    }
+
+    /**
+     * Regardless of how we read XML into XStreamDOM, XStreamDOM should retain the raw XML infoset,
+     * which means escaped names.
+     */
+    @Test
+    public void escapeHandling() throws Exception {
+        String input = getTestData("XStreamDOMTest.data3.xml");
+
+        XStreamDOM dom = XStreamDOM.from(new StringReader(input));
+        List<XStreamDOM> children = dom.getChildren().get(0).getChildren().get(0).getChildren();
+        assertNamesAreEscaped(children);
+
+        Foo foo = (Foo) xs.fromXML(new StringReader(input));
+        assertNamesAreEscaped(foo.bar.getChildren());
+
+        StringWriter sw = new StringWriter();
+        dom.writeTo(sw);
+        assertTrue(sw.toString().contains("bar_-bar"));
+        assertTrue(sw.toString().contains("zot__bar"));
+
+        String s = xs.toXML(foo);
+        assertTrue(s.contains("bar_-bar"));
+        assertTrue(s.contains("zot__bar"));
+    }
+
+    private void assertNamesAreEscaped(List<XStreamDOM> children) {
+        assertEquals("bar_-bar", children.get(0).getTagName());
+        assertEquals("zot__bar", children.get(1).getTagName());
     }
 }

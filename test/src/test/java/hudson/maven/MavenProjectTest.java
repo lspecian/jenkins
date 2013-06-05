@@ -23,6 +23,8 @@
  */
 package hudson.maven;
 
+import hudson.maven.local_repo.PerJobLocalRepositoryLocator;
+import hudson.model.AbstractProject;
 import hudson.model.Item;
 import hudson.model.Result;
 import hudson.tasks.Maven.MavenInstallation;
@@ -30,23 +32,42 @@ import hudson.tasks.Shell;
 
 import java.io.File;
 
+import jenkins.model.Jenkins;
+import jenkins.mvn.DefaultGlobalSettingsProvider;
+import jenkins.mvn.DefaultSettingsProvider;
+import jenkins.mvn.FilePathGlobalSettingsProvider;
+import jenkins.mvn.FilePathSettingsProvider;
+import jenkins.mvn.GlobalMavenConfig;
+
 import org.junit.Assert;
 import org.jvnet.hudson.test.Bug;
 import org.jvnet.hudson.test.ExtractResourceSCM;
 import org.jvnet.hudson.test.HudsonTestCase;
 
-import com.gargoylesoftware.htmlunit.FailingHttpStatusCodeException;
+import java.net.HttpURLConnection;
 
 /**
  * @author huybrechts
  */
 public class MavenProjectTest extends HudsonTestCase {
+    
 
     public void testOnMaster() throws Exception {
         MavenModuleSet project = createSimpleProject();
         project.setGoals("validate");
 
         buildAndAssertSuccess(project);
+    }
+    
+    @Bug(16499)
+    public void testCopyFromExistingMavenProject() throws Exception {
+        MavenModuleSet project = createSimpleProject();
+        project.setGoals("abcdefg");
+        project.save();
+        
+        MavenModuleSet copy = (MavenModuleSet) Jenkins.getInstance().copy((AbstractProject<?, ?>)project, "copy" + System.currentTimeMillis());
+        assertNotNull("Copied project must not be null", copy);
+        assertEquals(project.getGoals(), copy.getGoals());
     }
 
     private MavenModuleSet createSimpleProject() throws Exception {
@@ -59,6 +80,7 @@ public class MavenProjectTest extends HudsonTestCase {
         project.setScm(new ExtractResourceSCM(getClass().getResource(
                 scmResource)));
         project.setMaven(mi.getName());
+        project.setLocalRepository(new PerJobLocalRepositoryLocator());
         return project;
     }
 
@@ -83,12 +105,7 @@ public class MavenProjectTest extends HudsonTestCase {
         // this should succeed
         HudsonTestCase.WebClient wc = new WebClient();
         wc.getPage(project,"site");
-        try {
-            wc.getPage(project,"site/no-such-file");
-            fail("should have resulted in 404");
-        } catch (FailingHttpStatusCodeException e) {
-            assertEquals(404,e.getStatusCode());
-        }
+        wc.assertFails(project.getUrl() + "site/no-such-file", HttpURLConnection.HTTP_NOT_FOUND);
     }
 
     /**
@@ -134,7 +151,7 @@ public class MavenProjectTest extends HudsonTestCase {
     @Bug(6779)
     public void testDeleteSetBuildDeletesModuleBuilds() throws Exception {
         MavenModuleSet project = createProject("maven-multimod.zip");
-        project.setGoals("package");
+        project.setGoals("install");
         buildAndAssertSuccess(project);
         buildAndAssertSuccess(project.getModule("org.jvnet.hudson.main.test.multimod:moduleB"));
         buildAndAssertSuccess(project);
@@ -154,6 +171,23 @@ public class MavenProjectTest extends HudsonTestCase {
         project.setGoals("install");
         buildAndAssertSuccess(project);
     }
+    
+    @Bug(17177)
+    public void testCorrectResultInPostStepAfterFailedPreBuildStep() throws Exception {
+        MavenModuleSet p = createSimpleProject();
+        MavenInstallation mi = configureDefaultMaven();
+        p.setMaven(mi.getName());
+        p.setGoals("initialize");
+        
+        Shell pre = new Shell("exit 1"); // must fail to simulate scenario!
+        p.getPrebuilders().add(pre);
+        ResultExposingBuilder resultExposer = new ResultExposingBuilder();
+        p.getPostbuilders().add(resultExposer);
+        
+        assertBuildStatus(Result.FAILURE, p.scheduleBuild2(0).get());
+        assertEquals("The result passed to the post build step was not the one from the pre build step", Result.FAILURE, resultExposer.getResult());
+    }
+    
 
     /**
      * Config roundtrip test around pre/post build step
@@ -178,6 +212,29 @@ public class MavenProjectTest extends HudsonTestCase {
             m.setRunPostStepsIfResult(r);
             configRoundtrip((Item)m);
             assertEquals(r,m.getRunPostStepsIfResult());
+        }
+    }
+    
+    
+    public void testDefaultSettingsProvider() throws Exception {
+        {
+            MavenModuleSet m = createMavenProject();
+    
+            assertNotNull(m);
+            assertEquals(DefaultSettingsProvider.class, m.getSettings().getClass());
+            assertEquals(DefaultGlobalSettingsProvider.class, m.getGlobalSettings().getClass());
+        }
+        
+        {
+            GlobalMavenConfig globalMavenConfig = GlobalMavenConfig.get();
+            assertNotNull("No global Maven Config available", globalMavenConfig);
+            globalMavenConfig.setSettingsProvider(new FilePathSettingsProvider("/tmp/settigns.xml"));
+            globalMavenConfig.setGlobalSettingsProvider(new FilePathGlobalSettingsProvider("/tmp/global-settigns.xml"));
+            
+            MavenModuleSet m = createMavenProject();
+            assertEquals(FilePathSettingsProvider.class, m.getSettings().getClass());
+            assertEquals("/tmp/settigns.xml", ((FilePathSettingsProvider)m.getSettings()).getPath());
+            assertEquals("/tmp/global-settigns.xml", ((FilePathGlobalSettingsProvider)m.getGlobalSettings()).getPath());
         }
     }
 }

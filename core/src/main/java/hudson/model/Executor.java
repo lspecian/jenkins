@@ -49,6 +49,7 @@ import org.kohsuke.stapler.export.Exported;
 import javax.servlet.ServletException;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Vector;
 import java.util.logging.Logger;
@@ -57,6 +58,7 @@ import java.lang.reflect.Method;
 
 import static hudson.model.queue.Executables.*;
 import static java.util.logging.Level.FINE;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 
 /**
@@ -134,6 +136,9 @@ public class Executor extends Thread implements ModelObject {
      * Interrupt the execution. Mark the cause and the status accordingly.
      */
     public void interrupt(Result result, CauseOfInterruption... causes) {
+        if (LOGGER.isLoggable(FINE))
+            LOGGER.log(FINE, String.format("%s is interrupted(%s): %s", getDisplayName(), result, Util.join(Arrays.asList(causes),",")), new InterruptedException());
+
         interruptStatus = result;
         synchronized (this.causes) {
             for (CauseOfInterruption c : causes) {
@@ -465,15 +470,26 @@ public class Executor extends Thread implements ModelObject {
     }
 
     /**
-     * Stops the current build.
+     * @deprecated as of 1.489
+     *      Use {@link #doStop()}.
      */
+    @RequirePOST
     public void doStop( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+        doStop().generateResponse(req,rsp,this);
+    }
+
+    /**
+     * Stops the current build.
+     * 
+     * @since 1.489
+     */
+    public HttpResponse doStop() {
         Queue.Executable e = executable;
         if(e!=null) {
             Tasks.getOwnerTaskOf(getParentOf(e)).checkAbortPermission();
             interrupt();
         }
-        rsp.forwardToPreviousPage(req);
+        return HttpResponses.forwardToPreviousPage();
     }
 
     /**

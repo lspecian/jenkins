@@ -24,7 +24,6 @@
 package hudson.model;
 
 import antlr.ANTLRException;
-import hudson.Util;
 import static hudson.Util.fixNull;
 
 import hudson.model.labels.LabelAtom;
@@ -45,6 +44,9 @@ import hudson.slaves.Cloud;
 import hudson.util.QuotedStringTokenizer;
 import hudson.util.VariableResolver;
 import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithChildren;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
 
@@ -71,7 +73,7 @@ import com.thoughtworks.xstream.io.HierarchicalStreamReader;
  * @see Jenkins#getLabel(String)
  */
 @ExportedBean
-public abstract class Label extends Actionable implements Comparable<Label>, ModelObject {
+public abstract class Label extends Actionable implements Comparable<Label>, ModelObjectWithChildren {
     /**
      * Display name of this label.
      */
@@ -276,7 +278,7 @@ public abstract class Label extends Actionable implements Comparable<Label>, Mod
         int r=0;
         for (Node n : getNodes()) {
             Computer c = n.toComputer();
-            if(c!=null && (c.isOnline() || c.isConnecting()))
+            if(c!=null && (c.isOnline() || c.isConnecting()) && c.isAcceptingTasks())
                 r += c.countIdle();
         }
         return r;
@@ -336,7 +338,7 @@ public abstract class Label extends Actionable implements Comparable<Label>, Mod
     @Exported
     public List<AbstractProject> getTiedJobs() {
         List<AbstractProject> r = new ArrayList<AbstractProject>();
-        for( AbstractProject p : Util.filter(Jenkins.getInstance().getItems(),AbstractProject.class) ) {
+        for (AbstractProject<?,?> p : Jenkins.getInstance().getAllItems(AbstractProject.class)) {
             if(this.equals(p.getAssignedLabel()))
                 r.add(p);
         }
@@ -454,6 +456,14 @@ public abstract class Label extends Actionable implements Comparable<Label>, Mod
     @Override
     public String toString() {
         return name;
+    }
+
+    public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+        ContextMenu menu = new ContextMenu();
+        for (Node node : getNodes()) {
+            menu.add(node);
+        }
+        return menu;
     }
 
     public static final class ConverterImpl implements Converter {

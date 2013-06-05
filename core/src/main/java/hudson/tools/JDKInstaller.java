@@ -227,10 +227,10 @@ public class JDKInstaller extends ToolInstaller {
             ArgumentListBuilder args = new ArgumentListBuilder();
             args.add(jdkBundle);
             if (isJava15() || isJava14()) {
-                args.add("/s","/v/qn REBOOT=ReallySuppress INSTALLDIR=\\\""+ expectedLocation +"\\\" /L \\\""+logFile+"\\\"");
+                args.add("/s","/v/qn REBOOT=ReallySuppress INSTALLDIR=\""+ expectedLocation +"\" /L \""+logFile+"\"");
             } else {
                 // modern version supports arguments in more sane format.
-                args.add("/s","/v","/qn","/L","\\\""+logFile+"\\\"","REBOOT=ReallySuppress","INSTALLDIR=\\\""+ expectedLocation+"\\\"");
+                args.add("/s","/v","/qn","/L","\""+logFile+"\"","REBOOT=ReallySuppress","INSTALLDIR=\""+ expectedLocation+"\"");
             }
             // according to http://community.acresso.com/showthread.php?t=83301, \" is the trick to quote values with whitespaces.
             // Oh Windows, oh windows, why do you have to be so difficult?
@@ -490,11 +490,7 @@ public class JDKInstaller extends ToolInstaller {
          * Determines the platform of the given node.
          */
         public static Platform of(Node n) throws IOException,InterruptedException,DetectionFailedException {
-            return n.getChannel().call(new Callable<Platform,DetectionFailedException>() {
-                public Platform call() throws DetectionFailedException {
-                    return current();
-                }
-            });
+            return n.getChannel().call(new GetCurrentPlatform());
         }
 
         public static Platform current() throws DetectionFailedException {
@@ -504,6 +500,14 @@ public class JDKInstaller extends ToolInstaller {
             if(arch.contains("sun") || arch.contains("solaris"))    return SOLARIS;
             throw new DetectionFailedException("Unknown CPU name: "+arch);
         }
+
+        static class GetCurrentPlatform implements Callable<Platform,DetectionFailedException> {
+            private static final long serialVersionUID = 1L;
+            public Platform call() throws DetectionFailedException {
+                return current();
+            }
+        }
+
     }
 
     /**
@@ -542,11 +546,7 @@ public class JDKInstaller extends ToolInstaller {
          * Determines the CPU of the given node.
          */
         public static CPU of(Node n) throws IOException,InterruptedException, DetectionFailedException {
-            return n.getChannel().call(new Callable<CPU,DetectionFailedException>() {
-                public CPU call() throws DetectionFailedException {
-                    return current();
-                }
-            });
+            return n.getChannel().call(new GetCurrentCPU());
         }
 
         /**
@@ -562,6 +562,14 @@ public class JDKInstaller extends ToolInstaller {
             if(arch.contains("86"))    return i386;
             throw new DetectionFailedException("Unknown CPU architecture: "+arch);
         }
+
+        static class GetCurrentCPU implements Callable<CPU,DetectionFailedException> {
+            private static final long serialVersionUID = 1L;
+            public CPU call() throws DetectionFailedException {
+                return current();
+            }
+        }
+
     }
 
     /**

@@ -57,10 +57,12 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.List;
 import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
 
 import jenkins.model.Jenkins;
 import jenkins.util.io.OnMaster;
 import net.sf.json.JSONObject;
+import org.jvnet.localizer.Localizable;
 import org.kohsuke.stapler.BindInterceptor;
 import org.kohsuke.stapler.Stapler;
 import org.kohsuke.stapler.StaplerRequest;
@@ -83,7 +85,7 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
     private static final Logger LOGGER = Logger.getLogger(Node.class.getName());
 
     /**
-     * Newly copied slaves get this flag set, so that Hudson doesn't try to start this node until its configuration
+     * Newly copied slaves get this flag set, so that Jenkins doesn't try to start/remove this node until its configuration
      * is saved once.
      */
     protected volatile transient boolean holdOffLaunchUntilSave;
@@ -159,7 +161,7 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
      *      this method can return null if there's no {@link Computer} object for this node,
      *      such as when this node has no executors at all.
      */
-    public final Computer toComputer() {
+    public final @CheckForNull Computer toComputer() {
         AbstractCIBase ciBase = Jenkins.getInstance();
         return ciBase.getComputer(this);
     }
@@ -169,7 +171,7 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
      *
      * This is just a convenience method for {@link Computer#getChannel()} with null check. 
      */
-    public final VirtualChannel getChannel() {
+    public final @CheckForNull VirtualChannel getChannel() {
         Computer c = toComputer();
         return c==null ? null : c.getChannel();
     }
@@ -364,7 +366,7 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
     /**
      * Gets the {@link FilePath} on this node.
      */
-    public FilePath createPath(String absolutePath) {
+    public @CheckForNull FilePath createPath(String absolutePath) {
         VirtualChannel ch = getChannel();
         if(ch==null)    return null;    // offline
         return new FilePath(ch,absolutePath);
@@ -441,20 +443,20 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
      * Constants that control how Hudson allocates jobs to slaves.
      */
     public enum Mode {
-        NORMAL(Messages.Node_Mode_NORMAL()),
-        EXCLUSIVE(Messages.Node_Mode_EXCLUSIVE());
+        NORMAL(Messages._Node_Mode_NORMAL()),
+        EXCLUSIVE(Messages._Node_Mode_EXCLUSIVE());
 
-        private final String description;
+        private final Localizable description;
 
         public String getDescription() {
-            return description;
+            return description.toString();
         }
 
         public String getName() {
             return name();
         }
 
-        Mode(String description) {
+        Mode(Localizable description) {
             this.description = description;
         }
 
