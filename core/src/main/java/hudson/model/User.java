@@ -33,17 +33,20 @@ import hudson.security.ACL;
 import hudson.security.AccessControlled;
 import hudson.security.Permission;
 import hudson.security.SecurityRealm;
+import hudson.util.FormApply;
 import hudson.util.RunList;
 import hudson.util.XStream2;
 import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithContextMenu;
 import net.sf.json.JSONObject;
 
 import org.acegisecurity.Authentication;
-import org.acegisecurity.AuthenticationException;
 import org.acegisecurity.GrantedAuthority;
 import org.acegisecurity.providers.UsernamePasswordAuthenticationToken;
 import org.acegisecurity.providers.anonymous.AnonymousAuthenticationToken;
 import org.acegisecurity.userdetails.UserDetails;
+import org.acegisecurity.userdetails.UsernameNotFoundException;
+import org.springframework.dao.DataAccessException;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
 import org.kohsuke.stapler.export.Exported;
@@ -51,7 +54,6 @@ import org.kohsuke.stapler.export.ExportedBean;
 import org.apache.commons.io.filefilter.DirectoryFileFilter;
 import org.kohsuke.stapler.interceptor.RequirePOST;
 
-import javax.annotation.Nullable;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletResponse;
 import java.io.File;
@@ -99,7 +101,7 @@ import javax.annotation.Nonnull;
  * @author Kohsuke Kawaguchi
  */
 @ExportedBean
-public class User extends AbstractModelObject implements AccessControlled, DescriptorByNameOwner, Saveable, Comparable<User> {
+public class User extends AbstractModelObject implements AccessControlled, DescriptorByNameOwner, Saveable, Comparable<User>, ModelObjectWithContextMenu {
     
     private transient final String id;
 
@@ -253,11 +255,14 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         try {
             UserDetails u = Jenkins.getInstance().getSecurityRealm().loadUserByUsername(id);
             return new UsernamePasswordAuthenticationToken(u.getUsername(), "", u.getAuthorities());
-        } catch (AuthenticationException e) {
-            // TODO: use the stored GrantedAuthorities
-            return new UsernamePasswordAuthenticationToken(id, "",
-                new GrantedAuthority[]{SecurityRealm.AUTHENTICATED_AUTHORITY});
+        } catch (UsernameNotFoundException e) {
+            // ignore
+        } catch (DataAccessException e) {
+            // ignore
         }
+        // TODO: use the stored GrantedAuthorities
+        return new UsernamePasswordAuthenticationToken(id, "",
+            new GrantedAuthority[]{SecurityRealm.AUTHENTICATED_AUTHORITY});
     }
 
     /**
@@ -529,7 +534,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
 
         save();
 
-        rsp.sendRedirect(".");
+        FormApply.success(".").generateResponse(req,rsp,this);
     }
 
     /**
@@ -588,7 +593,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
     /**
      * Used to load/save user configuration.
      */
-    private static final XStream XSTREAM = new XStream2();
+    public static final XStream2 XSTREAM = new XStream2();
 
     private static final Logger LOGGER = Logger.getLogger(User.class.getName());
 
@@ -621,6 +626,30 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
     public boolean canDelete() {
         return hasPermission(Jenkins.ADMINISTER) && !id.equals(Jenkins.getAuthentication().getName())
                 && new File(getRootDir(), id).exists();
+    }
+
+    /**
+     * Checks for authorities (groups) associated with this user.
+     * If the caller lacks {@link Jenkins#ADMINISTER}, or any problems arise, returns an empty list.
+     * {@link SecurityRealm#AUTHENTICATED_AUTHORITY} and the username, if present, are omitted.
+     * @since 1.498
+     * @return a possibly empty list
+     */
+    public @Nonnull List<String> getAuthorities() {
+        if (!Jenkins.getInstance().hasPermission(Jenkins.ADMINISTER)) {
+            return Collections.emptyList();
+        }
+        List<String> r = new ArrayList<String>();
+        for (GrantedAuthority a : impersonate().getAuthorities()) {
+            if (a.equals(SecurityRealm.AUTHENTICATED_AUTHORITY)) {
+                continue;
+            }
+            String n = a.getAuthority();
+            if (n != null && !n.equals(id)) {
+                r.add(n);
+            }
+        }
+        return r;
     }
 
     public Descriptor getDescriptorByName(String className) {
@@ -665,6 +694,10 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             actions.addAll(factory.createFor(this));
         }
         return Collections.unmodifiableList(actions);
+    }
+
+    public ContextMenu doContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+        return new ContextMenu().from(this,request,response);
     }
 
     public static abstract class CanonicalIdResolver extends AbstractDescribableImpl<CanonicalIdResolver> implements Comparable<CanonicalIdResolver> {

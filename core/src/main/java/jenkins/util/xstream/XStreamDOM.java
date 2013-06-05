@@ -35,10 +35,20 @@ import com.thoughtworks.xstream.io.xml.AbstractXmlReader;
 import com.thoughtworks.xstream.io.xml.AbstractXmlWriter;
 import com.thoughtworks.xstream.io.xml.DocumentReader;
 import com.thoughtworks.xstream.io.xml.XmlFriendlyReplacer;
+import com.thoughtworks.xstream.io.xml.XppDriver;
 import hudson.Util;
 import hudson.util.VariableResolver;
+import hudson.util.XStream2;
+import org.apache.commons.io.IOUtils;
 
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.Reader;
+import java.io.StringReader;
+import java.io.StringWriter;
+import java.io.Writer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -60,6 +70,53 @@ import java.util.Stack;
  * <p>
  * The reverse operation is {@link #from(XStream, Object)} method, which marshals an object
  * into {@link XStreamDOM}.
+ *
+ * <p>
+ * You can also use this class to parse an entire XML document into a DOM like tree with
+ * {@link #from(HierarchicalStreamReader)} and {@link #writeTo(HierarchicalStreamWriter)}.
+ * These two methods support variants that accept other forms.
+ * <p>
+ * Whereas the above methods read from and write to {@link HierarchicalStreamReader} and,
+ * {@link HierarchicalStreamWriter}, we can also create {@link HierarchicalStreamReader}
+ * that read from DOM and {@link HierarchicalStreamWriter} that writes to DOM. See
+ * {@link #newReader()} and {@link #newWriter()} for those operations.
+ *
+ * <h3>XStreamDOM as a field of another XStream-enabled class</h3>
+ * <p>
+ * {@link XStreamDOM} can be used as a type of a field of another class that's itself XStream-enabled,
+ * such as this:
+ *
+ * <pre>
+ * class Foo {
+ *     XStreamDOM bar;
+ * }
+ * </pre>
+ *
+ * With the following XML:
+ *
+ * <pre>
+ * &lt;foo>
+ *   &lt;bar>
+ *     &lt;payload>
+ *       ...
+ *     &lt;/payload>
+ *   &lt;/bar>
+ * &lt;/foo>
+ * </pre>
+ *
+ * <p>
+ * The {@link XStreamDOM} object in the bar field will have the "payload" element in its tag name
+ * (which means the bar element cannot have multiple children.)
+ *
+ * <h3>XStream and name escaping</h3>
+ * <p>
+ * Because XStream wants to use letters like '$' that's not legal as a name char in XML,
+ * the XML data model that it thinks of (unescaped) is actually translated into the actual
+ * XML-compliant infoset via {@link XmlFriendlyReplacer}. This translation is done by
+ * {@link HierarchicalStreamReader} and {@link HierarchicalStreamWriter}, transparently
+ * from {@link Converter}s. In {@link XStreamDOM}, we'd like to hold the XML infoset
+ * (escaped form, in XStream speak), so in our {@link ConverterImpl} we go out of the way
+ * to cancel out this effect.
  *
  * @author Kohsuke Kawaguchi
  * @since 1.473
@@ -185,12 +242,46 @@ public class XStreamDOM {
     }
 
     /**
+     * Writes this {@link XStreamDOM} into {@link OutputStream}.
+     */
+    public void writeTo(OutputStream os) {
+        writeTo(new XppDriver().createWriter(os));
+    }
+
+    public void writeTo(Writer w) {
+        writeTo(new XppDriver().createWriter(w));
+    }
+
+    public void writeTo(HierarchicalStreamWriter w) {
+        new ConverterImpl().marshal(this,w,null);
+    }
+
+    /**
      * Marshals the given object with the given XStream into {@link XStreamDOM} and return it.
      */
     public static XStreamDOM from(XStream xs, Object obj) {
         WriterImpl w = newWriter();
         xs.marshal(obj, w);
         return w.getOutput();
+    }
+
+    public static XStreamDOM from(InputStream in) {
+        return from(new XppDriver().createReader(in));
+    }
+
+    public static XStreamDOM from(Reader in) {
+        return from(new XppDriver().createReader(in));
+    }
+
+    public static XStreamDOM from(HierarchicalStreamReader in) {
+        return new ConverterImpl().unmarshalElement(in, null);
+    }
+
+    public Map<String, String> getAttributeMap() {
+        Map<String,String> r = new HashMap<String, String>();
+        for (int i=0; i<attributes.length; i+=2)
+            r.put(attributes[i],attributes[i+1]);
+        return r;
     }
 
     private static class ReaderImpl extends AbstractXmlReader implements DocumentReader {
@@ -381,11 +472,26 @@ public class XStreamDOM {
             return type==XStreamDOM.class;
         }
 
+        /**
+         * {@link XStreamDOM} holds infoset (which is 'escaped' from XStream's PoV),
+         * whereas {@link HierarchicalStreamWriter} expects unescaped names,
+         * so we need to unescape it first before calling into {@link HierarchicalStreamWriter}.
+         */
+        // TODO: ideally we'd like to use the contextual HierarchicalStreamWriter to unescape,
+        // but this object isn't exposed to us
+        private String unescape(String s) {
+            return REPLACER.unescapeName(s);
+        }
+
+        private String escape(String s) {
+            return REPLACER.escapeName(s);
+        }
+
         public void marshal(Object source, HierarchicalStreamWriter w, MarshallingContext context) {
             XStreamDOM dom = (XStreamDOM)source;
-            w.startNode(dom.tagName);
+            w.startNode(unescape(dom.tagName));
             for (int i=0; i<dom.attributes.length; i+=2)
-                w.addAttribute(dom.attributes[i],dom.attributes[i+1]);
+                w.addAttribute(unescape(dom.attributes[i]),dom.attributes[i+1]);
             if (dom.value!=null)
                 w.setValue(dom.value);
             else {
@@ -396,15 +502,23 @@ public class XStreamDOM {
             w.endNode();
         }
 
+        /**
+         * Unmarshals a single child element.
+         */
         public XStreamDOM unmarshal(HierarchicalStreamReader r, UnmarshallingContext context) {
             r.moveDown();
+            XStreamDOM dom = unmarshalElement(r,context);
+            r.moveUp();
+            return dom;
+        }
 
-            String name = r.getNodeName();
+        public XStreamDOM unmarshalElement(HierarchicalStreamReader r, UnmarshallingContext context) {
+            String name = escape(r.getNodeName());
 
             int c = r.getAttributeCount();
             String[] attributes = new String[c*2];
             for (int i=0; i<c; i++) {
-                attributes[i*2]   = r.getAttributeName(i);
+                attributes[i*2]   = escape(r.getAttributeName(i));
                 attributes[i*2+1] = r.getAttribute(i);
             }
 
@@ -418,9 +532,10 @@ public class XStreamDOM {
             } else {
                 value = r.getValue();
             }
-            r.moveUp();
 
             return new XStreamDOM(name,attributes,children,value);
         }
     }
+
+    public static XmlFriendlyReplacer REPLACER = new XmlFriendlyReplacer();
 }

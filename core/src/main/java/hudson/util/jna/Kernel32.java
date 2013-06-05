@@ -27,7 +27,6 @@ import com.sun.jna.Pointer;
 import com.sun.jna.ptr.IntByReference;
 import com.sun.jna.win32.StdCallLibrary;
 import com.sun.jna.WString;
-import com.sun.jna.Native;
 
 /**
  * JNA interface to Windows Kernel32 exports.
@@ -35,7 +34,7 @@ import com.sun.jna.Native;
  * @author Kohsuke Kawaguchi
  */
 public interface Kernel32 extends StdCallLibrary {
-    Kernel32 INSTANCE = (Kernel32)Native.loadLibrary("kernel32", Kernel32.class);
+    Kernel32 INSTANCE = Kernel32Utils.load();
 
     /**
      * See http://msdn.microsoft.com/en-us/library/aa365240(VS.85).aspx
@@ -55,5 +54,23 @@ public interface Kernel32 extends StdCallLibrary {
     int GetFileAttributesW(WString lpFileName);
     boolean GetExitCodeProcess(Pointer handle, IntByReference r);
 
+    /**
+     * Creates a symbolic link.
+     *
+     * Windows Vista+, Windows Server 2008+
+     *
+     * @param lpSymlinkFileName
+     *      Symbolic link to be created
+     * @param lpTargetFileName
+     *      Target of the link.
+     * @param dwFlags
+     *      0 or {@link #SYMBOLIC_LINK_FLAG_DIRECTORY}
+     * @see <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa363866(v=vs.85).aspx">MSDN</a>
+     */
+    boolean CreateSymbolicLinkW(WString lpSymlinkFileName, WString lpTargetFileName, int dwFlags);
+    int SYMBOLIC_LINK_FLAG_DIRECTORY = 1;
+
     int STILL_ACTIVE = 259;
+
+    // DWORD == int
 }

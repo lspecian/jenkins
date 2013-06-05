@@ -48,6 +48,8 @@ import hudson.model.Items;
 import hudson.model.JDK;
 import hudson.model.Job;
 import hudson.model.Label;
+import hudson.model.ParameterDefinition;
+import hudson.model.ParametersDefinitionProperty;
 import hudson.model.Queue.FlyweightTask;
 import hudson.model.Result;
 import hudson.model.SCMedItem;
@@ -63,6 +65,7 @@ import hudson.util.CopyOnWriteMap;
 import hudson.util.DescribableList;
 import hudson.util.FormValidation;
 import hudson.util.FormValidation.Kind;
+import jenkins.model.ModelObjectWithChildren;
 import jenkins.scm.SCMCheckoutStrategyDescriptor;
 import net.sf.json.JSONObject;
 import org.kohsuke.stapler.HttpResponse;
@@ -88,6 +91,8 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * {@link Job} that allows you to run multiple different configurations
@@ -471,7 +476,7 @@ public class MatrixProject extends AbstractProject<MatrixProject,MatrixBuild> im
         buildWrappers.setOwner(this);
 
         if (executionStrategy ==null)
-            executionStrategy = new DefaultMatrixExecutionStrategyImpl(runSequentially,touchStoneCombinationFilter,touchStoneResultCondition,sorter);
+            executionStrategy = new DefaultMatrixExecutionStrategyImpl(runSequentially != null ? runSequentially : false, touchStoneCombinationFilter, touchStoneResultCondition, sorter);
 
         rebuildConfigurations(null);
     }
@@ -602,13 +607,16 @@ public class MatrixProject extends AbstractProject<MatrixProject,MatrixBuild> im
         }
 
         // find all active configurations
-        Set<MatrixConfiguration> active = new LinkedHashSet<MatrixConfiguration>();
+        final Set<MatrixConfiguration> active = new LinkedHashSet<MatrixConfiguration>();
+        final boolean isDynamicFilter = isDynamicFilter(getCombinationFilter());
+
         for (Combination c : activeCombinations) {
-            if(c.evalGroovyExpression(axes,combinationFilter)) {
+            if(isDynamicFilter || c.evalGroovyExpression(axes,getCombinationFilter())) {
         		LOGGER.fine("Adding configuration: " + c);
 	            MatrixConfiguration config = configurations.get(c);
 	            if(config==null) {
 	                config = new MatrixConfiguration(this,c);
+                    config.onCreatedFromScratch();
 	                config.save();
 	                configurations.put(config.getCombination(), config);
 	            }
@@ -618,6 +626,27 @@ public class MatrixProject extends AbstractProject<MatrixProject,MatrixBuild> im
         this.activeConfigurations = active;
 
         return active;
+    }
+
+    private boolean isDynamicFilter(final String filter) {
+
+        if (!isParameterized() || filter == null) return false;
+
+        final ParametersDefinitionProperty paramDefProp = getProperty(ParametersDefinitionProperty.class);
+
+        for (final ParameterDefinition definition : paramDefProp.getParameterDefinitions()) {
+
+            final String name = definition.getName();
+
+            final Matcher matcher = Pattern
+                    .compile("\\b" + name + "\\b")
+                    .matcher(filter)
+            ;
+
+            if (matcher.find()) return true;
+        }
+
+        return false;
     }
 
     private File getConfigurationsDir() {
@@ -665,6 +694,9 @@ public class MatrixProject extends AbstractProject<MatrixProject,MatrixBuild> im
     }
 
     public MatrixConfiguration getItem(Combination c) {
+        if (configurations == null) {
+            return null;
+        }
         return configurations.get(c);
     }
 
@@ -849,6 +881,14 @@ public class MatrixProject extends AbstractProject<MatrixProject,MatrixBuild> im
         return rsp;
     }
 
+    @Override
+    public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+        ContextMenu menu = new ContextMenu();
+        for (MatrixConfiguration c : getActiveConfigurations()) {
+            menu.add(c);
+        }
+        return menu;
+    }
 
     public DescriptorImpl getDescriptor() {
         return DESCRIPTOR;

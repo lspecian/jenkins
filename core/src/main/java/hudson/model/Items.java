@@ -30,6 +30,7 @@ import hudson.matrix.MatrixProject;
 import hudson.matrix.MatrixConfiguration;
 import hudson.XmlFile;
 import hudson.matrix.Axis;
+import hudson.triggers.Trigger;
 import hudson.util.DescriptorList;
 import hudson.util.XStream2;
 import jenkins.model.Jenkins;
@@ -52,6 +53,17 @@ public class Items {
      *      Use {@link #all()} for read access and {@link Extension} for registration.
      */
     public static final List<TopLevelItemDescriptor> LIST = (List)new DescriptorList<TopLevelItem>(TopLevelItem.class);
+
+    /**
+     * Used to behave differently when loading posted configuration as opposed to persisted configuration.
+     * @see Trigger#start
+     * @since 1.482
+     */
+    static final ThreadLocal<Boolean> updatingByXml = new ThreadLocal<Boolean>() {
+        @Override protected Boolean initialValue() {
+            return false;
+        }
+    };
 
     /**
      * Returns all the registered {@link TopLevelItemDescriptor}s.
@@ -222,6 +234,49 @@ public class Items {
      */
     public static XmlFile getConfigFile(Item item) {
         return getConfigFile(item.getRootDir());
+    }
+    
+    /**
+     * Gets all the {@link Item}s recursively in the {@link ItemGroup} tree
+     * and filter them by the given type.
+     * 
+     * @since 1.512
+     */
+    public static <T extends Item> List<T> getAllItems(final ItemGroup root, Class<T> type) {
+        List<T> r = new ArrayList<T>();
+
+        Stack<ItemGroup> q = new Stack<ItemGroup>();
+        q.push(root);
+
+        while(!q.isEmpty()) {
+            ItemGroup<?> parent = q.pop();
+            for (Item i : parent.getItems()) {
+                if(type.isInstance(i)) {
+                    if (i.hasPermission(Item.READ))
+                        r.add(type.cast(i));
+                }
+                if(i instanceof ItemGroup)
+                    q.push((ItemGroup)i);
+            }
+        }
+        // sort by relative name, ignoring case
+        Collections.sort(r, new Comparator<T>() {
+            @Override
+            public int compare(T o1, T o2) {
+                if (o1 == null) {
+                    if (o2 == null) {
+                        return 0;
+                    }
+                    return 1;
+                }
+                if (o2 == null) {
+                    return -1;
+                }
+                return o1.getRelativeNameFrom(root).compareToIgnoreCase(o2.getRelativeNameFrom(root));
+            }
+            
+        });
+        return r;
     }
 
     /**

@@ -28,11 +28,34 @@ package hudson;
 import hudson.cli.CLICommand;
 import hudson.console.ConsoleAnnotationDescriptor;
 import hudson.console.ConsoleAnnotatorFactory;
-import hudson.model.*;
+import hudson.model.AbstractProject;
+import hudson.model.Action;
+import hudson.model.Describable;
+import hudson.model.Descriptor;
+import hudson.model.DescriptorVisibilityFilter;
+import hudson.model.Hudson;
+import hudson.model.Item;
+import hudson.model.ItemGroup;
+import hudson.model.Items;
+import hudson.model.JDK;
+import hudson.model.Job;
+import hudson.model.JobPropertyDescriptor;
+import hudson.model.ModelObject;
+import hudson.model.Node;
+import hudson.model.PageDecorator;
+import hudson.model.ParameterDefinition;
 import hudson.model.ParameterDefinition.ParameterDescriptor;
+import hudson.model.Project;
+import hudson.model.Run;
+import hudson.model.TopLevelItem;
+import hudson.model.User;
+import hudson.model.View;
+import hudson.scm.SCM;
+import hudson.scm.SCMDescriptor;
 import hudson.search.SearchableModelObject;
 import hudson.security.AccessControlled;
 import hudson.security.AuthorizationStrategy;
+import hudson.security.GlobalSecurityConfiguration;
 import hudson.security.Permission;
 import hudson.security.SecurityRealm;
 import hudson.security.captcha.CaptchaSupport;
@@ -50,35 +73,11 @@ import hudson.tasks.Publisher;
 import hudson.tasks.UserAvatarResolver;
 import hudson.util.Area;
 import hudson.util.Iterators;
-import hudson.scm.SCM;
-import hudson.scm.SCMDescriptor;
 import hudson.util.Secret;
 import hudson.views.MyViewsTabBar;
 import hudson.views.ViewsTabBar;
 import hudson.widgets.RenderOnDemandClosure;
-import jenkins.model.GlobalConfiguration;
-import jenkins.model.Jenkins;
-import jenkins.model.ModelObjectWithContextMenu;
-import org.acegisecurity.providers.anonymous.AnonymousAuthenticationToken;
-import org.apache.commons.jelly.JellyContext;
-import org.apache.commons.jelly.JellyTagException;
-import org.apache.commons.jelly.Script;
-import org.apache.commons.jelly.XMLOutput;
-import org.apache.commons.jexl.parser.ASTSizeFunction;
-import org.apache.commons.jexl.util.Introspector;
-import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
-import org.jvnet.tiger_types.Types;
-import org.kohsuke.stapler.Ancestor;
-import org.kohsuke.stapler.Stapler;
-import org.kohsuke.stapler.StaplerRequest;
-import org.kohsuke.stapler.StaplerResponse;
-import org.kohsuke.stapler.jelly.InternationalizedStringExpression.RawHtmlArgument;
 
-import javax.management.modelmbean.DescriptorSupport;
-import javax.servlet.ServletException;
-import javax.servlet.http.Cookie;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -89,9 +88,11 @@ import java.lang.management.ManagementFactory;
 import java.lang.management.MonitorInfo;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
-import java.lang.reflect.Type;
 import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.text.DecimalFormat;
@@ -102,6 +103,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.ConcurrentModificationException;
+import java.util.Date;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
@@ -109,12 +111,43 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeMap;
-import java.util.Date;
+import java.util.logging.Level;
 import java.util.logging.LogManager;
 import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
 import java.util.regex.Pattern;
+
+import javax.servlet.ServletException;
+import javax.servlet.http.Cookie;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+import jenkins.model.GlobalConfiguration;
+import jenkins.model.GlobalConfigurationCategory;
+import jenkins.model.GlobalConfigurationCategory.Unclassified;
+import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithChildren;
+import jenkins.model.ModelObjectWithContextMenu;
+
+import org.acegisecurity.providers.anonymous.AnonymousAuthenticationToken;
+import org.apache.commons.jelly.JellyContext;
+import org.apache.commons.jelly.JellyTagException;
+import org.apache.commons.jelly.Script;
+import org.apache.commons.jelly.XMLOutput;
+import org.apache.commons.jexl.parser.ASTSizeFunction;
+import org.apache.commons.jexl.util.Introspector;
 import org.apache.commons.lang.StringUtils;
+import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
+import org.jvnet.tiger_types.Types;
+import org.kohsuke.stapler.Ancestor;
+import org.kohsuke.stapler.Stapler;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.jelly.InternationalizedStringExpression.RawHtmlArgument;
+
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
 
 /**
  * Utility functions used in views.
@@ -151,6 +184,10 @@ public class Functions {
         return o instanceof ModelObjectWithContextMenu;
     }
 
+    public static boolean isModelWithChildren(Object o) {
+        return o instanceof ModelObjectWithChildren;
+    }
+
     public static String xsDate(Calendar cal) {
         return Util.XS_DATETIME_FORMATTER.format(cal.getTime());
     }
@@ -161,10 +198,23 @@ public class Functions {
     
     public static void initPageVariables(JellyContext context) {
         String rootURL = Stapler.getCurrentRequest().getContextPath();
-        Functions h = new Functions();
 
-        context.setVariable("rootURL", rootURL);
+        Functions h = new Functions();
         context.setVariable("h", h);
+
+
+        // The path starts with a "/" character but does not end with a "/" character.
+        context.setVariable("rootURL", rootURL);
+
+        /*
+            load static resources from the path dedicated to a specific version.
+            This "/static/VERSION/abc/def.ghi" path is interpreted by stapler to be
+            the same thing as "/abc/def.ghi", but this avoids the stale cache
+            problem when the user upgrades to new Jenkins. Stapler also sets a long
+            future expiration dates for such static resources.
+
+            see https://wiki.jenkins-ci.org/display/JENKINS/Hyperlinks+in+HTML
+         */
         context.setVariable("resURL",rootURL+getResourcePath());
         context.setVariable("imagesURL",rootURL+getResourcePath()+"/images");
     }
@@ -758,32 +808,12 @@ public class Functions {
      * Perhaps it is better to introduce another annotation element? But then,
      * extensions shouldn't normally concern themselves about ordering too much, and the only reason
      * we needed this for {@link GlobalConfiguration}s are for backward compatibility.
+     *
+     * @param predicate
+     *      Filter the descriptors based on {@link GlobalConfigurationCategory}
+     * @since 1.494
      */
-    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig() {
-        class Tag implements Comparable<Tag> {
-            double ordinal;
-            String hierarchy;
-            Descriptor d;
-
-            Tag(double ordinal, Descriptor d) {
-                this.ordinal = ordinal;
-                this.d = d;
-                this.hierarchy = buildSuperclassHierarchy(d.clazz, new StringBuilder()).toString();
-            }
-
-            private StringBuilder buildSuperclassHierarchy(Class c, StringBuilder buf) {
-                Class sc = c.getSuperclass();
-                if (sc!=null)   buildSuperclassHierarchy(sc,buf).append(':');
-                return buf.append(c.getName());
-            }
-
-            public int compareTo(Tag that) {
-                int r = Double.compare(this.ordinal, that.ordinal);
-                if (r!=0)   return -r; // descending for ordinal
-                return this.hierarchy.compareTo(that.hierarchy);
-            }
-        }
-
+    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig(Predicate<GlobalConfigurationCategory> predicate) {
         ExtensionList<Descriptor> exts = Jenkins.getInstance().getExtensionList(Descriptor.class);
         List<Tag> r = new ArrayList<Tag>(exts.size());
 
@@ -791,7 +821,13 @@ public class Functions {
             Descriptor d = c.getInstance();
             if (d.getGlobalConfigPage()==null)  continue;
 
-            r.add(new Tag(d instanceof GlobalConfiguration ? c.ordinal() : 0, d));
+            if (d instanceof GlobalConfiguration) {
+                if (predicate.apply(((GlobalConfiguration)d).getCategory()))
+                    r.add(new Tag(c.ordinal(), d));
+            } else {
+                if (predicate.apply(GlobalConfigurationCategory.get(Unclassified.class)))
+                    r.add(new Tag(0, d));
+            }
         }
         Collections.sort(r);
 
@@ -801,7 +837,56 @@ public class Functions {
         return DescriptorVisibilityFilter.apply(Jenkins.getInstance(),answer);
     }
 
+    /**
+     * Like {@link #getSortedDescriptorsForGlobalConfig(Predicate)} but with a constant truth predicate, to include all descriptors.
+     */
+    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig() {
+        return getSortedDescriptorsForGlobalConfig(Predicates.<GlobalConfigurationCategory>alwaysTrue());
+    }
 
+    /**
+     * @deprecated This is rather meaningless.
+     */
+    @Deprecated
+    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfigNoSecurity() {
+        return getSortedDescriptorsForGlobalConfig(Predicates.not(GlobalSecurityConfiguration.FILTER));
+    }
+
+    /**
+     * Like {@link #getSortedDescriptorsForGlobalConfig(Predicate)} but for unclassified descriptors only.
+     * @since 1.506
+     */
+    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfigUnclassified() {
+        return getSortedDescriptorsForGlobalConfig(new Predicate<GlobalConfigurationCategory>() {
+            public boolean apply(GlobalConfigurationCategory cat) {
+                return cat instanceof GlobalConfigurationCategory.Unclassified;
+            }
+        });
+    }
+    
+    private static class Tag implements Comparable<Tag> {
+        double ordinal;
+        String hierarchy;
+        Descriptor d;
+
+        Tag(double ordinal, Descriptor d) {
+            this.ordinal = ordinal;
+            this.d = d;
+            this.hierarchy = buildSuperclassHierarchy(d.clazz, new StringBuilder()).toString();
+        }
+
+        private StringBuilder buildSuperclassHierarchy(Class c, StringBuilder buf) {
+            Class sc = c.getSuperclass();
+            if (sc!=null)   buildSuperclassHierarchy(sc,buf).append(':');
+            return buf.append(c.getName());
+        }
+
+        public int compareTo(Tag that) {
+            int r = Double.compare(this.ordinal, that.ordinal);
+            if (r!=0)   return -r; // descending for ordinal
+            return this.hierarchy.compareTo(that.hierarchy);
+        }
+    }
     /**
      * Computes the path to the icon of the given action
      * from the context path.
@@ -839,31 +924,129 @@ public class Functions {
         }
 
         String path = ancestors.get(p);
-        if(path!=null)  return path;
+        if(path!=null) {
+            return normalizeURI(path + '/');
+        }
 
         Item i=p;
         String url = "";
+        Collection<TopLevelItem> viewItems;
+        if (view != null) {
+            viewItems = view.getItems();
+        } else {
+            viewItems = Collections.emptyList();
+        }
         while(true) {
             ItemGroup ig = i.getParent();
             url = i.getShortUrl()+url;
 
-            if(ig== Jenkins.getInstance()) {
+            if(ig== Jenkins.getInstance() || (view != null && ig == view.getOwnerItemGroup())) {
                 assert i instanceof TopLevelItem;
-                if(view!=null && view.contains((TopLevelItem)i)) {
+                if(viewItems.contains((TopLevelItem)i)) {
                     // if p and the current page belongs to the same view, then return a relative path
-                    return ancestors.get(view)+'/'+url;
+                    return normalizeURI(ancestors.get(view)+'/'+url);
                 } else {
                     // otherwise return a path from the root Hudson
-                    return request.getContextPath()+'/'+p.getUrl();
+                    return normalizeURI(request.getContextPath()+'/'+p.getUrl());
                 }
             }
 
             path = ancestors.get(ig);
-            if(path!=null)  return path+'/'+url;
+            if(path!=null) {
+                return normalizeURI(path+'/'+url);
+            }
 
             assert ig instanceof Item; // if not, ig must have been the Hudson instance
             i = (Item) ig;
         }
+    }
+    
+    private static String normalizeURI(String uri) {
+        return URI.create(uri).normalize().toString();
+    }
+    
+    /**
+     * Gets all the {@link TopLevelItem}s recursively in the {@link ItemGroup} tree.
+     * 
+     * @since 1.512
+     */
+    public static List<TopLevelItem> getAllTopLevelItems(ItemGroup root) {
+      return Items.getAllItems(root, TopLevelItem.class);
+    }
+    
+    /**
+     * Gets the relative name or display name to the given item from the specified group.
+     *
+     * @since 1.515
+     * @param p the Item we want the relative display name
+     * @param g the ItemGroup used as point of reference for the item
+     * @param useDisplayName if true, returns a display name, otherwise returns a name
+     * @return
+     *      String like "foo » bar"
+     */
+    public static String getRelativeNameFrom(Item p, ItemGroup g, boolean useDisplayName) {
+        if (p == null) return null;
+        if (g == null) return useDisplayName ? p.getFullDisplayName() : p.getFullName();
+        String separationString = useDisplayName ? " » " : "/";
+        
+        // first list up all the parents
+        Map<ItemGroup,Integer> parents = new HashMap<ItemGroup,Integer>();
+        int depth=0;
+        while (g!=null) {
+            parents.put(g, depth++);
+            if (g instanceof Item)
+                g = ((Item)g).getParent();
+            else
+                g = null;
+        }
+
+        StringBuilder buf = new StringBuilder();
+        Item i=p;
+        while (true) {
+            if (buf.length()>0) buf.insert(0,separationString);
+            buf.insert(0,useDisplayName ? i.getDisplayName() : i.getName());
+            ItemGroup gr = i.getParent();
+
+            Integer d = parents.get(gr);
+            if (d!=null) {
+                String s="";
+                for (int j=d; j>0; j--)
+                    s+=".." + separationString;
+                return s+buf;
+            }
+
+            if (gr instanceof Item)
+                i = (Item)gr;
+            else
+                return null;
+        }
+    }
+    
+    /**
+     * Gets the name to the given item relative to given group.
+     *
+     * @since 1.515
+     * @param p the Item we want the relative display name
+     * @param g the ItemGroup used as point of reference for the item
+     * @return
+     *      String like "foo » bar"
+     */
+    public static String getRelativeNameFrom(Item p, ItemGroup g) {
+        return getRelativeNameFrom(p, g, false);
+    }    
+    
+    
+    /**
+     * Gets the relative display name to the given item from the specified group.
+     *
+     * @since 1.512
+     * @param p the Item we want the relative display name
+     * @param g the ItemGroup used as point of reference for the item
+     * @return
+     *      String like "foo » bar"
+     */
+    public static String getRelativeDisplayNameFrom(Item p, ItemGroup g) {
+        return getRelativeNameFrom(p, g, true);
     }
 
     public static Map<Thread,StackTraceElement[]> dumpAllThreads() {
@@ -1204,8 +1387,14 @@ public class Functions {
     public static String getActionUrl(String itUrl,Action action) {
         String urlName = action.getUrlName();
         if(urlName==null)   return null;    // to avoid NPE and fail to render the whole page
-        if(SCHEME.matcher(urlName).find())
-            return urlName; // absolute URL
+        try {
+            if (new URI(urlName).isAbsolute()) {
+                return urlName;
+            }
+        } catch (URISyntaxException x) {
+            Logger.getLogger(Functions.class.getName()).log(Level.WARNING, "Failed to parse URL for {0}: {1}", new Object[] {action, x});
+            return null;
+        }
         if(urlName.startsWith("/"))
             return joinPath(Stapler.getCurrentRequest().getContextPath(),urlName);
         else
@@ -1398,8 +1587,6 @@ public class Functions {
         return DescriptorVisibilityFilter.apply(context,descriptors);
     }
     
-    private static final Pattern SCHEME = Pattern.compile("^([a-zA-Z][a-zA-Z0-9+.-]*):");
-
     /**
      * Returns true if we are running unit tests.
      */
@@ -1510,6 +1697,9 @@ public class Functions {
      */
     public static String humanReadableByteSize(long size){
         String measure = "B";
+        if(size < 1024){
+            return size + " " + measure;
+        }
         Double number = new Double(size);
         if(number>=1024){
             number = number/1024;
@@ -1523,7 +1713,23 @@ public class Functions {
                 }
             }
         }
-        DecimalFormat format = new DecimalFormat("##.00");
+        DecimalFormat format = new DecimalFormat("#0.00");
         return format.format(number) + " " + measure;
+    }
+
+    /**
+     * Get a string that can be safely broken to several lines when necessary.
+     *
+     * This implementation inserts &lt;wbr> tags into string. It allows browsers
+     * to wrap line before any sequence of punctuation characters or anywhere
+     * in the middle of prolonged sequences of word characters.
+     *
+     * @since 1.517
+     */
+    public static String breakableString(final String plain) {
+
+        return plain.replaceAll("(\\p{Punct}+\\w)", "<wbr>$1")
+                .replaceAll("(\\w{10})(?=\\w{3})", "$1<wbr>")
+        ;
     }
 }
